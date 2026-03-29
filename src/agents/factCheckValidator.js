@@ -53,122 +53,119 @@ export async function factCheckValidatorNode(state) {
 
   if (!activeTaskIds?.length) return {};
 
-  // Find the section that just passed editor review
-  const activeTask = taskQueue?.find(
+  // Find all sections that just passed editor review
+  const activeTasks = taskQueue?.filter(
     (t) => activeTaskIds.includes(t.taskId) && t.status === 'edited'
-  );
+  ) || [];
 
-  if (!activeTask) {
-    console.warn('[factCheckValidator] No edited task found — skipping fact check');
+  if (activeTasks.length === 0) {
+    console.warn('[factCheckValidator] No edited tasks found — skipping fact check');
     return {};
   }
 
-  const drafted = draftedSections?.[activeTask.sectionId];
-  if (!drafted) return {};
-
-  console.log(`[factCheckValidator] Fact-checking: "${drafted.heading}"`);
-
   const llm = new ChatOpenAI({
     model:       MODEL,
-    temperature: 0.0,  // Zero temp — deterministic extraction
+    temperature: 0.0,
     maxTokens:   TOKEN_BUDGET.MAX_TOKENS_PER_CALL.factCheckValidator,
   });
 
-  // ── Step 1: Extract all factual claims ────────────────
-  let response;
-  try {
-    response = await llm.invoke([
-      new SystemMessage(CLAIM_EXTRACTOR_PROMPT),
-      new HumanMessage(`Extract all verifiable claims from this section:\n\n${drafted.rawText}`),
-    ]);
-  } catch (err) {
-    console.error('[factCheckValidator] Claim extraction failed:', err.message);
-    // On failure: approve and continue (don't block pipeline)
-    return {
-      draftedSections: {
-        [activeTask.sectionId]: { ...drafted, status: 'verified' },
-      },
-    };
+  const updatedTaskQueue = [...(taskQueue || [])];
+  const updatedDraftedSections = {};
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  const allNewHallucinations = [];
+
+  for (const activeTask of activeTasks) {
+    const drafted = draftedSections?.[activeTask.sectionId];
+    if (!drafted) continue;
+
+    console.log(`[factCheckValidator] Fact-checking: "${drafted.heading}"`);
+
+    // ── Step 1: Extract all factual claims ────────────────
+    let response;
+    try {
+      response = await llm.invoke([
+        new SystemMessage(CLAIM_EXTRACTOR_PROMPT),
+        new HumanMessage(`Extract all verifiable claims from this section:\n\n${drafted.rawText}`),
+      ]);
+      totalInputTokens += response.usage_metadata?.input_tokens || 0;
+      totalOutputTokens += response.usage_metadata?.output_tokens || 0;
+    } catch (err) {
+      console.error('[factCheckValidator] Claim extraction failed:', err.message);
+      const taskIdx = updatedTaskQueue.findIndex((t) => t.taskId === activeTask.taskId);
+      if (taskIdx !== -1) updatedTaskQueue[taskIdx] = { ...updatedTaskQueue[taskIdx], status: 'verified' };
+      updatedDraftedSections[activeTask.sectionId] = { ...drafted, status: 'verified' };
+      continue;
+    }
+
+    let extractedClaims = [];
+    try {
+      const cleaned = response.content.trim()
+        .replace(/^```json\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
+      const parsed = JSON.parse(cleaned);
+      extractedClaims = parsed.claims || [];
+    } catch {
+      console.warn('[factCheckValidator] Could not parse claims — treating as verified');
+    }
+
+    console.log(`[factCheckValidator] Extracted ${extractedClaims.length} claim(s) to verify for "${drafted.heading}"`);
+
+    // ── Step 2: Verify claims against Pinecone ────────────
+    let newHallucinations = [];
+
+    if (extractedClaims.length > 0) {
+      const claimTexts = extractedClaims.map((c) => c.claim);
+
+      let verificationResults;
+      try {
+        verificationResults = await verifyClaimsAgainstResearch(claimTexts, projectId);
+      } catch (err) {
+        console.warn('[factCheckValidator] Pinecone verification failed:', err.message);
+        verificationResults = claimTexts.map((claim) => ({ claim, isVerified: true }));
+      }
+
+      const unverified = verificationResults.filter((r) => !r.isVerified);
+      newHallucinations = unverified.map((r) => ({
+        sectionId:       activeTask.sectionId,
+        claim:           r.claim,
+        similarityScore: r.similarityScore,
+        closestEvidence: r.closestEvidence,
+        evidenceSource:  r.evidenceSource,
+      }));
+
+      allNewHallucinations.push(...newHallucinations);
+
+      verificationResults.forEach((r) => {
+        const icon = r.isVerified ? '✓' : '✗';
+        const score = r.similarityScore?.toFixed(2) || '0.00';
+        console.log(`[factCheckValidator] ${icon} [${score}] "${r.claim.slice(0, 60)}..."`);
+      });
+    }
+
+    // ── Step 3: Route verdict ──────────────────────────────
+    if (newHallucinations.length > 0) {
+      console.warn(`[factCheckValidator] ❌ ${newHallucinations.length} unverified claim(s) for "${drafted.heading}" — routing to rewrite`);
+    } else {
+      console.log(`[factCheckValidator] ✅ All claims verified for "${drafted.heading}" — section approved`);
+      const taskIdx = updatedTaskQueue.findIndex((t) => t.taskId === activeTask.taskId);
+      if (taskIdx !== -1) updatedTaskQueue[taskIdx] = { ...updatedTaskQueue[taskIdx], status: 'verified' };
+      updatedDraftedSections[activeTask.sectionId] = { ...drafted, status: 'verified', verifiedAt: new Date().toISOString() };
+    }
   }
 
   const { stateUpdate: tokenUpdate } = await trackTokenUsage({
     projectId,
     agentName:    'factCheckValidator',
     model:        MODEL,
-    inputTokens:  response.usage_metadata?.input_tokens  || 0,
-    outputTokens: response.usage_metadata?.output_tokens || 0,
+    inputTokens:  totalInputTokens,
+    outputTokens: totalOutputTokens,
   });
 
-  let extractedClaims = [];
-  try {
-    const cleaned = response.content.trim()
-      .replace(/^```json\s*/i, '')
-      .replace(/```\s*$/i, '')
-      .trim();
-    const parsed = JSON.parse(cleaned);
-    extractedClaims = parsed.claims || [];
-  } catch {
-    console.warn('[factCheckValidator] Could not parse claims — treating as verified');
-  }
-
-  console.log(`[factCheckValidator] Extracted ${extractedClaims.length} claim(s) to verify`);
-
-  // ── Step 2: Verify claims against Pinecone ────────────
-  let newHallucinations = [];
-
-  if (extractedClaims.length > 0) {
-    const claimTexts = extractedClaims.map((c) => c.claim);
-
-    let verificationResults;
-    try {
-      verificationResults = await verifyClaimsAgainstResearch(claimTexts, projectId);
-    } catch (err) {
-      console.warn('[factCheckValidator] Pinecone verification failed:', err.message);
-      // On Pinecone failure: approve section (don't block)
-      verificationResults = claimTexts.map((claim) => ({ claim, isVerified: true }));
-    }
-
-    const unverified = verificationResults.filter((r) => !r.isVerified);
-    newHallucinations = unverified.map((r) => ({
-      sectionId:       activeTask.sectionId,
-      claim:           r.claim,
-      similarityScore: r.similarityScore,
-      closestEvidence: r.closestEvidence,
-      evidenceSource:  r.evidenceSource,
-    }));
-
-    // Log results
-    verificationResults.forEach((r) => {
-      const icon = r.isVerified ? '✓' : '✗';
-      const score = r.similarityScore?.toFixed(2) || '0.00';
-      console.log(`[factCheckValidator] ${icon} [${score}] "${r.claim.slice(0, 60)}..."`);
-    });
-  }
-
-  // ── Step 3: Route verdict ──────────────────────────────
-  const updatedTaskQueue = [...(state.taskQueue || [])];
-
-  if (newHallucinations.length > 0) {
-    console.warn(`[factCheckValidator] ❌ ${newHallucinations.length} unverified claim(s) — routing to rewrite`);
-    return {
-      detectedHallucinations: newHallucinations,
-      ...tokenUpdate,
-    };
-  }
-
-  // All claims verified — mark section as verified
-  console.log(`[factCheckValidator] ✅ All claims verified — section approved`);
-
-  const taskIdx = updatedTaskQueue.findIndex((t) => t.taskId === activeTask.taskId);
-  if (taskIdx !== -1) {
-    updatedTaskQueue[taskIdx] = { ...updatedTaskQueue[taskIdx], status: 'verified' };
-  }
-
   return {
-    draftedSections: {
-      [activeTask.sectionId]: { ...drafted, status: 'verified', verifiedAt: new Date().toISOString() },
-    },
-    detectedHallucinations: [],
+    draftedSections: updatedDraftedSections,
+    detectedHallucinations: allNewHallucinations,
     taskQueue: updatedTaskQueue,
     ...tokenUpdate,
   };

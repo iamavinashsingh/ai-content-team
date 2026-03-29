@@ -74,37 +74,23 @@ export async function editorAgentNode(state) {
     return {};
   }
 
-  // Only review the first active task (editor is sequential)
-  const activeTask = taskQueue?.find(
+  // Only review tasks that are active and currently drafted
+  const activeTasks = taskQueue?.filter(
     (t) => activeTaskIds.includes(t.taskId) && t.status === 'drafted'
-  );
+  ) || [];
 
-  if (!activeTask) {
-    console.warn('[editorAgent] No drafted task found in active tasks');
+  if (activeTasks.length === 0) {
+    console.warn('[editorAgent] No drafted tasks found in active tasks');
     return {};
   }
 
-  const drafted = draftedSections?.[activeTask.sectionId];
-  if (!drafted) {
-    console.warn(`[editorAgent] No draft found for section: ${activeTask.sectionId}`);
-    return {};
-  }
-
-  // ── Rejection limit check ──────────────────────────────
-  const currentRejections = editorRejectionCounts?.[activeTask.sectionId] || 0;
-  if (currentRejections >= LOOP_LIMITS.editorAgentRejections) {
-    console.warn(`[editorAgent] Section "${activeTask.heading}" hit rejection limit (${currentRejections}) — routing to simplifyTask`);
-    return {
-      lastEditorFeedback: {
-        sectionId: activeTask.sectionId,
-        verdict:   'rejected',
-        issues:    ['Max rejections reached — section will be split into smaller parts'],
-        forcedEscalation: true,
-      },
-    };
-  }
-
-  console.log(`[editorAgent] Reviewing: "${drafted.heading}" (${drafted.wordCount} words, rejection #${currentRejections})`);
+  const updatedRejectionCounts = { ...editorRejectionCounts };
+  const updatedTaskQueue = [...(taskQueue || [])];
+  const updatedDraftedSections = {};
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let lastAppendedFeedback = null;
+  const newErrors = [];
 
   const llm = new ChatOpenAI({
     model:       MODEL,
@@ -112,17 +98,39 @@ export async function editorAgentNode(state) {
     maxTokens:   TOKEN_BUDGET.MAX_TOKENS_PER_CALL.editorAgent,
   });
 
-  // Build context for the editor
-  const registrySummary = Object.entries(sectionRegistry || {})
-    .filter(([id]) => id !== activeTask.sectionId)
-    .map(([id, entry]) => `[${id}] ${entry.summary}`)
-    .join('\n') || 'First section — no prior context.';
+  for (const activeTask of activeTasks) {
+    const drafted = draftedSections?.[activeTask.sectionId];
+    if (!drafted) {
+      console.warn(`[editorAgent] No draft found for section: ${activeTask.sectionId}`);
+      continue;
+    }
 
-  const voiceContext = brandVoicePatterns
-    ? `Established brand voice: ${brandVoicePatterns.tone}, ${brandVoicePatterns.pacing}`
-    : 'No brand voice established yet.';
+    // ── Rejection limit check ──────────────────────────────
+    const currentRejections = updatedRejectionCounts[activeTask.sectionId] || 0;
+    if (currentRejections >= LOOP_LIMITS.editorAgentRejections) {
+      console.warn(`[editorAgent] Section "${activeTask.heading}" hit rejection limit (${currentRejections}) — routing to simplifyTask`);
+      lastAppendedFeedback = {
+        sectionId: activeTask.sectionId,
+        verdict:   'rejected',
+        issues:    ['Max rejections reached — section will be split into smaller parts'],
+        forcedEscalation: true,
+      };
+      continue;
+    }
 
-  const userPrompt = `Review this article section:
+    console.log(`[editorAgent] Reviewing: "${drafted.heading}" (${drafted.wordCount} words, rejection #${currentRejections})`);
+
+    // Build context for the editor
+    const registrySummary = Object.entries(sectionRegistry || {})
+      .filter(([id]) => id !== activeTask.sectionId)
+      .map(([id, entry]) => `[${id}] ${entry.summary}`)
+      .join('\n') || 'First section — no prior context.';
+
+    const voiceContext = brandVoicePatterns
+      ? `Established brand voice: ${brandVoicePatterns.tone}, ${brandVoicePatterns.pacing}`
+      : 'No brand voice established yet.';
+
+    const userPrompt = `Review this article section:
 
 Article Tone: ${structuredBrief.tone}
 Target Audience: ${structuredBrief.targetAudience}
@@ -138,87 +146,89 @@ Section to review:
 
 ${drafted.rawText}`;
 
-  let response;
-  try {
-    response = await llm.invoke([
-      new SystemMessage(EDITOR_SYSTEM_PROMPT),
-      new HumanMessage(userPrompt),
-    ]);
-  } catch (err) {
-    console.error('[editorAgent] LLM call failed:', err.message);
-    // On LLM failure, auto-approve to avoid blocking the pipeline
-    return {
-      lastEditorFeedback: { sectionId: activeTask.sectionId, verdict: 'approved', issues: [] },
-      errors: [{ node: 'editorAgent', error: err.message, timestamp: new Date().toISOString() }],
-    };
-  }
+    let response;
+    try {
+      response = await llm.invoke([
+        new SystemMessage(EDITOR_SYSTEM_PROMPT),
+        new HumanMessage(userPrompt),
+      ]);
+      totalInputTokens += response.usage_metadata?.input_tokens || 0;
+      totalOutputTokens += response.usage_metadata?.output_tokens || 0;
+    } catch (err) {
+      console.error('[editorAgent] LLM call failed:', err.message);
+      // On LLM failure, auto-approve to avoid blocking the pipeline
+      lastAppendedFeedback = { sectionId: activeTask.sectionId, verdict: 'approved', issues: [] };
+      newErrors.push({ node: 'editorAgent', error: err.message, timestamp: new Date().toISOString() });
+      const taskIdx = updatedTaskQueue.findIndex((t) => t.taskId === activeTask.taskId);
+      if (taskIdx !== -1) updatedTaskQueue[taskIdx] = { ...updatedTaskQueue[taskIdx], status: 'edited' };
+      updatedDraftedSections[activeTask.sectionId] = { ...drafted, status: 'edited' };
+      continue;
+    }
 
-  const { stateUpdate: tokenUpdate } = await trackTokenUsage({
-    projectId:    state.projectId,
-    agentName:    'editorAgent',
-    model:        MODEL,
-    inputTokens:  response.usage_metadata?.input_tokens  || 0,
-    outputTokens: response.usage_metadata?.output_tokens || 0,
-  });
+    let parsed;
+    try {
+      const cleaned = response.content.trim()
+        .replace(/^```json\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
+      parsed = JSON.parse(cleaned);
+    } catch {
+      // Parse failure → approve and continue
+      console.warn('[editorAgent] Could not parse response — auto-approving');
+      lastAppendedFeedback = { sectionId: activeTask.sectionId, verdict: 'approved', issues: [] };
+      const taskIdx = updatedTaskQueue.findIndex((t) => t.taskId === activeTask.taskId);
+      if (taskIdx !== -1) updatedTaskQueue[taskIdx] = { ...updatedTaskQueue[taskIdx], status: 'edited' };
+      updatedDraftedSections[activeTask.sectionId] = { ...drafted, status: 'edited' };
+      continue;
+    }
 
-  let parsed;
-  try {
-    const cleaned = response.content.trim()
-      .replace(/^```json\s*/i, '')
-      .replace(/```\s*$/i, '')
-      .trim();
-    parsed = JSON.parse(cleaned);
-  } catch {
-    // Parse failure → approve and continue
-    console.warn('[editorAgent] Could not parse response — auto-approving');
-    return {
-      lastEditorFeedback: { sectionId: activeTask.sectionId, verdict: 'approved', issues: [] },
-      ...tokenUpdate,
-    };
-  }
+    const avgScore = Object.values(parsed.scores || {}).reduce((a, b) => a + b, 0) /
+      Math.max(Object.keys(parsed.scores || {}).length, 1);
 
-  const avgScore = Object.values(parsed.scores || {}).reduce((a, b) => a + b, 0) /
-    Math.max(Object.keys(parsed.scores || {}).length, 1);
+    console.log(`[editorAgent] Verdict: ${parsed.verdict.toUpperCase()} (avg score: ${avgScore.toFixed(1)}/10)`);
+    if (parsed.issues?.length > 0) {
+      parsed.issues.forEach((issue) => console.log(`  ✗ ${issue}`));
+    }
 
-  console.log(`[editorAgent] Verdict: ${parsed.verdict.toUpperCase()} (avg score: ${avgScore.toFixed(1)}/10)`);
-  if (parsed.issues?.length > 0) {
-    parsed.issues.forEach((issue) => console.log(`  ✗ ${issue}`));
-  }
-
-  // ── Update state ───────────────────────────────────────
-  const updatedRejectionCounts = { ...editorRejectionCounts };
-  const updatedTaskQueue = [...(taskQueue || [])];
-  const updatedDraftedSections = {};
-
-  if (parsed.verdict === 'approved') {
-    // Mark section as edited in queue and drafted sections
-    const taskIdx = updatedTaskQueue.findIndex((t) => t.taskId === activeTask.taskId);
-    if (taskIdx !== -1) updatedTaskQueue[taskIdx] = { ...updatedTaskQueue[taskIdx], status: 'edited' };
-
-    updatedDraftedSections[activeTask.sectionId] = {
-      ...drafted,
-      status:   'edited',
-      editedAt: new Date().toISOString(),
-      scores:   parsed.scores,
-    };
-  } else {
-    // Increment rejection counter for this section
-    updatedRejectionCounts[activeTask.sectionId] = currentRejections + 1;
-    console.warn(`[editorAgent] Rejection ${currentRejections + 1}/${LOOP_LIMITS.editorAgentRejections} for "${drafted.heading}"`);
-  }
-
-  return {
-    lastEditorFeedback: {
+    lastAppendedFeedback = {
       sectionId: activeTask.sectionId,
       taskId:    activeTask.taskId,
       verdict:   parsed.verdict,
       issues:    parsed.issues || [],
       strengths: parsed.strengths || [],
       scores:    parsed.scores || {},
-    },
+    };
+
+    if (parsed.verdict === 'approved') {
+      const taskIdx = updatedTaskQueue.findIndex((t) => t.taskId === activeTask.taskId);
+      if (taskIdx !== -1) updatedTaskQueue[taskIdx] = { ...updatedTaskQueue[taskIdx], status: 'edited' };
+
+      updatedDraftedSections[activeTask.sectionId] = {
+        ...drafted,
+        status:   'edited',
+        editedAt: new Date().toISOString(),
+        scores:   parsed.scores,
+      };
+    } else {
+      updatedRejectionCounts[activeTask.sectionId] = currentRejections + 1;
+      console.warn(`[editorAgent] Rejection ${currentRejections + 1}/${LOOP_LIMITS.editorAgentRejections} for "${drafted.heading}"`);
+    }
+  }
+
+  const { stateUpdate: tokenUpdate } = await trackTokenUsage({
+    projectId:    state.projectId,
+    agentName:    'editorAgent',
+    model:        MODEL,
+    inputTokens:  totalInputTokens,
+    outputTokens: totalOutputTokens,
+  });
+
+  return {
+    lastEditorFeedback:    lastAppendedFeedback,
     editorRejectionCounts: updatedRejectionCounts,
     draftedSections:       updatedDraftedSections,
     taskQueue:             updatedTaskQueue,
+    ...(newErrors.length > 0 ? { errors: newErrors } : {}),
     ...tokenUpdate,
   };
 }

@@ -83,31 +83,15 @@ export async function mediaAgentNode(state) {
 
   if (!activeTaskIds?.length) return {};
 
-  // Find the verified section
-  const activeTask = taskQueue?.find(
+  // Find the verified sections
+  const activeTasks = taskQueue?.filter(
     (t) => activeTaskIds.includes(t.taskId) && t.status === 'verified'
-  );
+  ) || [];
 
-  if (!activeTask) {
-    console.warn('[mediaAgent] No verified task found');
+  if (activeTasks.length === 0) {
+    console.warn('[mediaAgent] No verified tasks found');
     return {};
   }
-
-  // Skip if section doesn't need media
-  if (!activeTask.requiresMedia) {
-    console.log(`[mediaAgent] Section "${activeTask.heading}" — no media required, skipping`);
-
-    // Still mark as media_done so the pipeline continues
-    const updatedQueue = (state.taskQueue || []).map((t) =>
-      t.taskId === activeTask.taskId ? { ...t, status: 'media_done' } : t
-    );
-    return { taskQueue: updatedQueue };
-  }
-
-  const drafted = draftedSections?.[activeTask.sectionId];
-  if (!drafted) return {};
-
-  console.log(`[mediaAgent] Generating media for: "${drafted.heading}"`);
 
   const llm = new ChatOpenAI({
     model:       MODEL,
@@ -115,115 +99,133 @@ export async function mediaAgentNode(state) {
     maxTokens:   TOKEN_BUDGET.MAX_TOKENS_PER_CALL.default,
   });
 
-  // ── Step 1: Generate DALL-E prompt from actual text ───
-  let promptData;
-  let promptInputTokens = 0, promptOutputTokens = 0;
+  const updatedQueue = [...(state.taskQueue || [])];
+  const updatedGeneratedMedia = {};
+  const updatedDraftedSections = {};
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
-  try {
-    const response = await llm.invoke([
-      new SystemMessage(PROMPT_GEN_SYSTEM),
-      new HumanMessage(
-        `Section heading: "${drafted.heading}"\n` +
-        `Section hint: ${activeTask.mediaHint || 'none'}\n` +
-        `Article tone: ${structuredBrief.tone}\n\n` +
-        `Section text (generate a prompt that visually represents THIS content):\n` +
-        `${drafted.rawText.slice(0, 800)}`
-      ),
-    ]);
+  for (const activeTask of activeTasks) {
+    // Skip if section doesn't need media
+    if (!activeTask.requiresMedia) {
+      console.log(`[mediaAgent] Section "${activeTask.heading}" — no media required, skipping`);
+      const taskIdx = updatedQueue.findIndex((t) => t.taskId === activeTask.taskId);
+      if (taskIdx !== -1) updatedQueue[taskIdx] = { ...updatedQueue[taskIdx], status: 'media_done' };
+      continue;
+    }
 
-    promptInputTokens  = response.usage_metadata?.input_tokens  || 0;
-    promptOutputTokens = response.usage_metadata?.output_tokens || 0;
+    const drafted = draftedSections?.[activeTask.sectionId];
+    if (!drafted) continue;
 
-    const cleaned = response.content.trim()
-      .replace(/^```json\s*/i, '')
-      .replace(/```\s*$/i, '')
-      .trim();
-    promptData = JSON.parse(cleaned);
-  } catch (err) {
-    console.error('[mediaAgent] Prompt generation failed:', err.message);
-    // Skip media for this section rather than blocking the pipeline
-    const updatedQueue = (state.taskQueue || []).map((t) =>
-      t.taskId === activeTask.taskId ? { ...t, status: 'media_done' } : t
-    );
-    return { taskQueue: updatedQueue };
+    console.log(`[mediaAgent] Generating media for: "${drafted.heading}"`);
+
+    // ── Step 1: Generate DALL-E prompt from actual text ───
+    let promptData;
+    let promptInputTokens = 0;
+    let promptOutputTokens = 0;
+
+    try {
+      const response = await llm.invoke([
+        new SystemMessage(PROMPT_GEN_SYSTEM),
+        new HumanMessage(
+          `Section heading: "${drafted.heading}"\n` +
+          `Section hint: ${activeTask.mediaHint || 'none'}\n` +
+          `Article tone: ${structuredBrief.tone}\n\n` +
+          `Section text (generate a prompt that visually represents THIS content):\n` +
+          `${drafted.rawText.slice(0, 800)}`
+        ),
+      ]);
+
+      promptInputTokens  = response.usage_metadata?.input_tokens  || 0;
+      promptOutputTokens = response.usage_metadata?.output_tokens || 0;
+      totalInputTokens += promptInputTokens;
+      totalOutputTokens += promptOutputTokens;
+
+      const cleaned = response.content.trim()
+        .replace(/^```json\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
+      promptData = JSON.parse(cleaned);
+    } catch (err) {
+      console.error('[mediaAgent] Prompt generation failed:', err.message);
+      const taskIdx = updatedQueue.findIndex((t) => t.taskId === activeTask.taskId);
+      if (taskIdx !== -1) updatedQueue[taskIdx] = { ...updatedQueue[taskIdx], status: 'media_done' };
+      continue;
+    }
+
+    console.log(`[mediaAgent] Prompt: "${promptData.prompt.slice(0, 100)}..."`);
+
+    // ── Step 2: Generate image via DALL-E 3 ───────────────
+    let imageUrl  = null;
+    let s3Url     = null;
+
+    try {
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+      const imageResponse = await openai.images.generate({
+        model:   MODELS.IMAGE,
+        prompt:  promptData.prompt,
+        n:       1,
+        size:    '1024x1024',
+        quality: 'standard',
+        response_format: 'url',
+      });
+
+      imageUrl = imageResponse.data[0]?.url;
+      console.log(`[mediaAgent] DALL-E 3 image generated: ${imageUrl?.slice(0, 60)}...`);
+
+      await trackTokenUsage({
+        projectId:    state.projectId,
+        agentName:    'mediaAgent_dalle3',
+        model:        MODELS.IMAGE,
+        inputTokens:  0,
+        outputTokens: 0,
+        isImage:      true,
+        imageQuality: 'standard',
+      });
+
+      // ── Step 3: Fetch image and upload to S3 ─────────────
+      if (imageUrl) {
+        const imgResponse = await fetch(imageUrl);
+        const imgBuffer   = Buffer.from(await imgResponse.arrayBuffer());
+        s3Url = await uploadToS3(imgBuffer, state.projectId, activeTask.sectionId);
+        console.log(`[mediaAgent] Image stored: ${s3Url}`);
+      }
+    } catch (err) {
+      console.warn(`[mediaAgent] Image generation failed (safety/error): ${err.message}`);
+    }
+
+    // ── Update state ───────────────────────────────────────
+    const taskIdx = updatedQueue.findIndex((t) => t.taskId === activeTask.taskId);
+    if (taskIdx !== -1) updatedQueue[taskIdx] = { ...updatedQueue[taskIdx], status: 'media_done' };
+
+    updatedGeneratedMedia[activeTask.sectionId] = {
+      dallePrompt: promptData.prompt,
+      style:       promptData.style,
+      altText:     promptData.altText,
+      originalUrl: imageUrl,
+      s3Url:       s3Url || imageUrl,
+      generatedAt: new Date().toISOString(),
+    };
+
+    updatedDraftedSections[activeTask.sectionId] = {
+      ...drafted,
+      status:   'media_done',
+      mediaUrl: s3Url || imageUrl || null,
+    };
   }
 
   await trackTokenUsage({
     projectId: state.projectId,
     agentName: 'mediaAgent_promptGen',
     model:     MODEL,
-    inputTokens:  promptInputTokens,
-    outputTokens: promptOutputTokens,
+    inputTokens:  totalInputTokens,
+    outputTokens: totalOutputTokens,
   });
 
-  console.log(`[mediaAgent] Prompt: "${promptData.prompt.slice(0, 100)}..."`);
-
-  // ── Step 2: Generate image via DALL-E 3 ───────────────
-  let imageUrl  = null;
-  let s3Url     = null;
-
-  try {
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    const imageResponse = await openai.images.generate({
-      model:   MODELS.IMAGE,
-      prompt:  promptData.prompt,
-      n:       1,
-      size:    '1024x1024',
-      quality: 'standard',
-      response_format: 'url',
-    });
-
-    imageUrl = imageResponse.data[0]?.url;
-    console.log(`[mediaAgent] DALL-E 3 image generated: ${imageUrl?.slice(0, 60)}...`);
-
-    // Track image cost (flat rate, not token-based)
-    await trackTokenUsage({
-      projectId:    state.projectId,
-      agentName:    'mediaAgent_dalle3',
-      model:        MODELS.IMAGE,
-      inputTokens:  0,
-      outputTokens: 0,
-      isImage:      true,
-      imageQuality: 'standard',
-    });
-
-    // ── Step 3: Fetch image and upload to S3 ─────────────
-    if (imageUrl) {
-      const imgResponse = await fetch(imageUrl);
-      const imgBuffer   = Buffer.from(await imgResponse.arrayBuffer());
-      s3Url = await uploadToS3(imgBuffer, state.projectId, activeTask.sectionId);
-      console.log(`[mediaAgent] Image stored: ${s3Url}`);
-    }
-  } catch (err) {
-    // DALL-E can reject prompts for safety — handle gracefully
-    console.warn(`[mediaAgent] Image generation failed (safety/error): ${err.message}`);
-    // Continue without image — don't block the pipeline
-  }
-
-  // ── Update state ───────────────────────────────────────
-  const updatedQueue = (state.taskQueue || []).map((t) =>
-    t.taskId === activeTask.taskId ? { ...t, status: 'media_done' } : t
-  );
-
   return {
-    generatedMedia: {
-      [activeTask.sectionId]: {
-        dallePrompt: promptData.prompt,
-        style:       promptData.style,
-        altText:     promptData.altText,
-        originalUrl: imageUrl,
-        s3Url:       s3Url || imageUrl,   // Fall back to DALL-E URL if S3 fails
-        generatedAt: new Date().toISOString(),
-      },
-    },
-    taskQueue: updatedQueue,
-    draftedSections: {
-      [activeTask.sectionId]: {
-        ...drafted,
-        status:   'media_done',
-        mediaUrl: s3Url || imageUrl || null,
-      },
-    },
+    generatedMedia:  updatedGeneratedMedia,
+    taskQueue:       updatedQueue,
+    draftedSections: updatedDraftedSections,
   };
 }

@@ -172,6 +172,13 @@ function routeAfterFeedbackRouter(state) {
   return N.EDITOR_AGENT;
 }
 
+function routeAfterSelectNextTask(state) {
+  if (state.graphStatus === 'error') {
+    return END;
+  }
+  return N.CONTEXT_BUILDER;
+}
+
 // ── Graph Builder ──────────────────────────────────────────
 export function buildGraph() {
   const graph = new StateGraph(GraphState);
@@ -241,7 +248,10 @@ export function buildGraph() {
   });
 
   // Nodes 10-12: Task selection → context building → writing
-  graph.addEdge(N.SELECT_NEXT_TASK, N.CONTEXT_BUILDER);
+  graph.addConditionalEdges(N.SELECT_NEXT_TASK, routeAfterSelectNextTask, {
+    [N.CONTEXT_BUILDER]: N.CONTEXT_BUILDER,
+    [END]: END,
+  });
   graph.addEdge(N.CONTEXT_BUILDER,  N.WRITER_AGENT);
   graph.addEdge(N.WRITER_AGENT,     N.UPDATE_REGISTRY);
   graph.addEdge(N.UPDATE_REGISTRY,  N.EDITOR_AGENT);

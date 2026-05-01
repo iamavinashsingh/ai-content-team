@@ -1,4 +1,4 @@
-# AI Content Team — V2.0.0
+# AI Content Team — V2.0.0 [ Currently Working On]
 
 Autonomous multi-agent content production system built with LangGraph, Node.js, OpenAI, Pinecone, and Neon PostgreSQL.
 
